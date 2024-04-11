@@ -50,6 +50,7 @@ use reth_provider::{
 use reth_prune::PrunerBuilder;
 use reth_revm::EvmProcessorFactory;
 use reth_rpc_engine_api::EngineApi;
+use reth_stages::stages::TempManagerHandle;
 use reth_static_file::StaticFileProducer;
 use reth_tasks::TaskExecutor;
 use reth_tracing::tracing::{debug, error, info};
@@ -629,28 +630,32 @@ where
         future::join_all(exexs).await;
 
         // spawn exex manager
-        if !exex_handles.is_empty() {
-            debug!(target: "reth::cli", "spawning exex manager");
-            // todo(onbjerg): rm magic number
-            let exex_manager = ExExManager::new(exex_handles, 1024);
-            let mut exex_manager_handle = exex_manager.handle();
-            executor.spawn_critical("exex manager", async move {
-                exex_manager.await.expect("exex manager crashed");
-            });
+        let exex_manager_handle: Option<Box<dyn TempManagerHandle>> =
+            if !exex_handles.is_empty() {
+                debug!(target: "reth::cli", "spawning exex manager");
+                // todo(onbjerg): rm magic number
+                let exex_manager = ExExManager::new(exex_handles, 1024);
+                let exex_manager_handle = exex_manager.handle();
+                executor.spawn_critical("exex manager", async move {
+                    exex_manager.await.expect("exex manager crashed");
+                });
 
-            // send notifications from the blockchain tree to exex manager
-            let mut canon_state_notifications = blockchain_tree.subscribe_to_canonical_state();
-            executor.spawn_critical("exex manager blockchain tree notifications", async move {
-                while let Ok(notification) = canon_state_notifications.recv().await {
-                    exex_manager_handle
-                        .send_async(notification)
-                        .await
-                        .expect("blockchain tree notification could not be sent to exex manager");
-                }
-            });
+                // send notifications from the blockchain tree to exex manager
+                let mut canon_state_notifications = blockchain_tree.subscribe_to_canonical_state();
+                let handle = exex_manager_handle.clone();
+                executor.spawn_critical("exex manager blockchain tree notifications", async move {
+                    while let Ok(notification) = canon_state_notifications.recv().await {
+                        handle.clone().send_async(notification).await.expect(
+                            "blockchain tree notification could not be sent to exex manager",
+                        );
+                    }
+                });
 
-            info!(target: "reth::cli", "ExEx Manager started");
-        }
+                info!(target: "reth::cli", "ExEx Manager started");
+                Some(Box::new(exex_manager_handle))
+            } else {
+                None
+            };
 
         // create pipeline
         let network_client = network.fetch_client().await?;
@@ -717,6 +722,7 @@ where
                     max_block,
                     static_file_producer,
                     evm_config,
+                    exex_manager_handle,
                 )
                 .await?;
 
@@ -739,6 +745,7 @@ where
                     max_block,
                     static_file_producer,
                     evm_config,
+                    exex_manager_handle,
                 )
                 .await?;
 
